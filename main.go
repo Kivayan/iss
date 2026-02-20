@@ -1,0 +1,361 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+const (
+	animInterval      = 1 * time.Second
+	telemetryInterval = 5 * time.Second
+	issURL            = "http://api.open-notify.org/iss-now.json"
+	nominatimURL      = "https://nominatim.openstreetmap.org/reverse"
+	userAgent         = "iss-tui/1.0 (+https://github.com/kivayan/iss)"
+)
+
+const frameOne = ` & & & & & & & & & & & & & & &             & & & & & & & & & & & & & & &
+& & & & & & & & & & & & & & &   \\\\\\    & & & & & & & & & & & & & & &
+ & & & & & & & & & & & & & & &=============& & & & & & & & & & & & & & &
+                     ___      ___   |||||   ___      ___
+                    / _ \____/ _ \__|||||__/ _ \____/ _ \
+                   /_/ \____/_/ \_\_|||||_/_/ \____/_/ \_\
+ & & & & & & & & & & & & & & &=============& & & & & & & & & & & & & & &
+  & & & & & & & & & & & & & & &   /////\\\  & & & & & & & & & & & & & & &
+   & & & & & & & & & & & & & & &             & & & & & & & & & & & & & & &`
+
+const frameTwo = `& & & & & & & & & & & & & & &             & & & & & & & & & & & & & & &
+ & & & & & & & & & & & & & & &   \\\\\\   & & & & & & & & & & & & & & &
+  & & & & & & & & & & & & & & &=============& & & & & & & & & & & & & & &
+                    ___      ___   |||||   ___      ___
+                   / _ \____/ _ \__|||||__/ _ \____/ _ \
+                  /_/ \____/_/ \_\_|||||_/_/ \____/_/ \_\
+  & & & & & & & & & & & & & & &=============& & & & & & & & & & & & & & &
+ & & & & & & & & & & & & & & &   /////\\\   & & & & & & & & & & & & & & &
+& & & & & & & & & & & & & & &             & & & & & & & & & & & & & & &`
+
+type animTickMsg time.Time
+type telemetryTickMsg time.Time
+
+type telemetryMsg struct {
+	country string
+	lat     float64
+	lon     float64
+	err     error
+}
+
+type errMsg struct {
+	err error
+}
+
+type model struct {
+	frames     []string
+	frameIndex int
+	issOver    string
+	lat        float64
+	lon        float64
+	hasCoords  bool
+	lastErr    string
+	width      int
+	height     int
+	client     *http.Client
+}
+
+type issPositionResponse struct {
+	Message     string `json:"message"`
+	ISSPosition struct {
+		Latitude  string `json:"latitude"`
+		Longitude string `json:"longitude"`
+	} `json:"iss_position"`
+}
+
+type nominatimResponse struct {
+	Error       string `json:"error"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Category    string `json:"category"`
+	Type        string `json:"type"`
+	Addresstype string `json:"addresstype"`
+	Address     struct {
+		Country string `json:"country"`
+	} `json:"address"`
+}
+
+func main() {
+	m := model{
+		frames:  []string{frameOne, frameTwo},
+		issOver: "Resolving...",
+		client: &http.Client{
+			Timeout: 8 * time.Second,
+		},
+	}
+
+	p := tea.NewProgram(m)
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "application error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.Batch(animTick(animInterval), telemetryTick(0))
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		}
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+
+	case animTickMsg:
+		m.frameIndex = (m.frameIndex + 1) % len(m.frames)
+		return m, animTick(animInterval)
+
+	case telemetryTickMsg:
+		return m, tea.Batch(telemetryTick(telemetryInterval), fetchTelemetryCmd(m.client, m.issOver))
+
+	case telemetryMsg:
+		m.issOver = msg.country
+		m.lat = msg.lat
+		m.lon = msg.lon
+		m.hasCoords = true
+		if msg.err != nil {
+			m.lastErr = msg.err.Error()
+		} else {
+			m.lastErr = ""
+		}
+
+	case errMsg:
+		m.lastErr = msg.err.Error()
+	}
+
+	return m, nil
+}
+
+func (m model) View() string {
+	frame := m.frames[m.frameIndex]
+	telemetryLines := []string{"ISS over: " + m.issOver}
+	if m.hasCoords {
+		telemetryLines = append(telemetryLines, fmt.Sprintf("Coords: %.4f, %.4f", m.lat, m.lon))
+	} else {
+		telemetryLines = append(telemetryLines, "Coords: Resolving...")
+	}
+	telemetry := telemetryBox(telemetryLines)
+	return "\n" + frame + "\n\n" + telemetry
+}
+
+func animTick(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg {
+		return animTickMsg(t)
+	})
+}
+
+func telemetryTick(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg {
+		return telemetryTickMsg(t)
+	})
+}
+
+func fetchTelemetryCmd(client *http.Client, currentCountry string) tea.Cmd {
+	return func() tea.Msg {
+		lat, lon, err := fetchISSPosition(client)
+		if err != nil {
+			return errMsg{err: err}
+		}
+
+		country, err := reverseGeocodeCountry(client, lat, lon)
+		if err != nil {
+			return telemetryMsg{
+				country: currentCountry,
+				lat:     lat,
+				lon:     lon,
+				err:     err,
+			}
+		}
+
+		return telemetryMsg{
+			country: country,
+			lat:     lat,
+			lon:     lon,
+		}
+	}
+}
+
+func fetchISSPosition(client *http.Client) (float64, float64, error) {
+	req, err := http.NewRequest(http.MethodGet, issURL, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("iss api status: %s", resp.Status)
+	}
+
+	var payload issPositionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return 0, 0, err
+	}
+
+	if !strings.EqualFold(payload.Message, "success") {
+		return 0, 0, fmt.Errorf("open-notify message: %q", payload.Message)
+	}
+
+	lat, err := strconv.ParseFloat(payload.ISSPosition.Latitude, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid latitude %q: %w", payload.ISSPosition.Latitude, err)
+	}
+
+	lon, err := strconv.ParseFloat(payload.ISSPosition.Longitude, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid longitude %q: %w", payload.ISSPosition.Longitude, err)
+	}
+
+	return lat, lon, nil
+}
+
+func reverseGeocodeCountry(client *http.Client, lat, lon float64) (string, error) {
+	payload, err := reverseGeocode(client, lat, lon, 3)
+	if err != nil {
+		return "", err
+	}
+
+	if strings.EqualFold(payload.Error, "Unable to geocode") {
+		deepPayload, deepErr := reverseGeocode(client, lat, lon, 2)
+		if deepErr != nil {
+			return "Ocean", nil
+		}
+
+		if name := oceanOrWaterName(deepPayload); name != "" {
+			return name, nil
+		}
+
+		return "Ocean", nil
+	}
+
+	if country := strings.TrimSpace(payload.Address.Country); country != "" {
+		return country, nil
+	}
+
+	if name := oceanOrWaterName(payload); name != "" {
+		return name, nil
+	}
+
+	deepPayload, err := reverseGeocode(client, lat, lon, 2)
+	if err != nil {
+		return "Ocean", nil
+	}
+
+	if name := oceanOrWaterName(deepPayload); name != "" {
+		return name, nil
+	}
+
+	return "Ocean", nil
+}
+
+func reverseGeocode(client *http.Client, lat, lon float64, zoom int) (nominatimResponse, error) {
+	q := url.Values{}
+	q.Set("format", "jsonv2")
+	q.Set("lat", strconv.FormatFloat(lat, 'f', -1, 64))
+	q.Set("lon", strconv.FormatFloat(lon, 'f', -1, 64))
+	q.Set("zoom", strconv.Itoa(zoom))
+	q.Set("addressdetails", "1")
+	q.Set("accept-language", "en")
+
+	u, err := url.Parse(nominatimURL)
+	if err != nil {
+		return nominatimResponse{}, err
+	}
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nominatimResponse{}, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept-Language", "en")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nominatimResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nominatimResponse{}, fmt.Errorf("nominatim status: %s", resp.Status)
+	}
+
+	var payload nominatimResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nominatimResponse{}, err
+	}
+
+	return payload, nil
+}
+
+func oceanOrWaterName(payload nominatimResponse) string {
+	name := strings.TrimSpace(payload.Name)
+	if name == "" {
+		name = strings.TrimSpace(strings.Split(payload.DisplayName, ",")[0])
+	}
+
+	if name == "" {
+		return ""
+	}
+
+	typeValue := strings.ToLower(strings.TrimSpace(payload.Type))
+	category := strings.ToLower(strings.TrimSpace(payload.Category))
+	addresstype := strings.ToLower(strings.TrimSpace(payload.Addresstype))
+	loweredName := strings.ToLower(name)
+
+	if addresstype == "ocean" || typeValue == "ocean" || typeValue == "sea" || typeValue == "bay" || typeValue == "strait" || category == "natural" {
+		return name
+	}
+
+	if strings.Contains(loweredName, "ocean") || strings.Contains(loweredName, "sea") || strings.Contains(loweredName, "gulf") || strings.Contains(loweredName, "strait") || strings.Contains(loweredName, "bay") {
+		return name
+	}
+
+	return ""
+}
+
+func telemetryBox(lines []string) string {
+	contentWidth := 0
+	for _, line := range lines {
+		if w := len([]rune(line)); w > contentWidth {
+			contentWidth = w
+		}
+	}
+
+	width := contentWidth + 2
+	border := "+" + strings.Repeat("-", width) + "+"
+
+	rendered := make([]string, 0, len(lines)+2)
+	rendered = append(rendered, border)
+	for _, line := range lines {
+		padding := strings.Repeat(" ", contentWidth-len([]rune(line)))
+		rendered = append(rendered, "| "+line+padding+" |")
+	}
+	rendered = append(rendered, border)
+
+	return strings.Join(rendered, "\n")
+}
