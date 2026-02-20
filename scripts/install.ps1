@@ -19,16 +19,41 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\iss"
 }
 
-if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
+if ($env:OS -ne "Windows_NT") {
     throw "This installer supports Windows only."
 }
 
-$archValue = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-switch ($archValue) {
-    "X64" { $arch = "amd64" }
-    "Arm64" { $arch = "arm64" }
-    default { throw "Unsupported architecture: $archValue" }
+function Resolve-Arch {
+    try {
+        $runtimeType = [type]::GetType("System.Runtime.InteropServices.RuntimeInformation")
+        if ($runtimeType -and $runtimeType.GetProperty("OSArchitecture")) {
+            $archValue = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToUpperInvariant()
+            switch ($archValue) {
+                "X64" { return "amd64" }
+                "ARM64" { return "arm64" }
+            }
+        }
+    }
+    catch {
+    }
+
+    $fallbackArch = $env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($fallbackArch)) {
+        $fallbackArch = $env:PROCESSOR_ARCHITECTURE
+    }
+
+    if ([string]::IsNullOrWhiteSpace($fallbackArch)) {
+        throw "Could not determine CPU architecture."
+    }
+
+    switch ($fallbackArch.ToUpperInvariant()) {
+        "AMD64" { return "amd64" }
+        "ARM64" { return "arm64" }
+        default { throw "Unsupported architecture: $fallbackArch" }
+    }
 }
+
+$arch = Resolve-Arch
 
 if ($Version -ne "latest" -and -not $Version.StartsWith("v")) {
     $Version = "v$Version"
