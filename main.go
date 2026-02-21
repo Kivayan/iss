@@ -10,15 +10,23 @@ import (
 	"strings"
 	"time"
 
+	mapascii "github.com/Kivayan/map-ascii"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 const (
-	animInterval      = 1 * time.Second
 	telemetryInterval = 5 * time.Second
 	issURL            = "http://api.open-notify.org/iss-now.json"
 	nominatimURL      = "https://nominatim.openstreetmap.org/reverse"
 	userAgent         = "iss-tui/1.0 (+https://github.com/kivayan/iss)"
+	defaultMapWidth   = 60
+	minMapWidth       = 30
+	maxMapWidth       = 120
+	mapSupersample    = 3
+	mapCharAspect     = 2.0
+	mapMarginRows     = 1
+	markerArmX        = 4
+	markerArmY        = 2
 )
 
 const frameOne = ` & & & & & & & & & & & & & & &             & & & & & & & & & & & & & & &
@@ -41,7 +49,6 @@ const frameTwo = `& & & & & & & & & & & & & & &             & & & & & & & & & & 
  & & & & & & & & & & & & & & &   /////\\\   & & & & & & & & & & & & & & &
 & & & & & & & & & & & & & & &             & & & & & & & & & & & & & & &`
 
-type animTickMsg time.Time
 type telemetryTickMsg time.Time
 
 type telemetryMsg struct {
@@ -56,16 +63,16 @@ type errMsg struct {
 }
 
 type model struct {
-	frames     []string
-	frameIndex int
-	issOver    string
-	lat        float64
-	lon        float64
-	hasCoords  bool
-	lastErr    string
-	width      int
-	height     int
-	client     *http.Client
+	issOver   string
+	lat       float64
+	lon       float64
+	hasCoords bool
+	lastErr   string
+	width     int
+	height    int
+	client    *http.Client
+	mapMask   *mapascii.LandMask
+	mapASCII  string
 }
 
 type issPositionResponse struct {
@@ -89,9 +96,29 @@ type nominatimResponse struct {
 }
 
 func main() {
+	mask, maskErr := mapascii.LoadEmbeddedDefaultLandMask()
+	initialErr := ""
+	if maskErr != nil {
+		initialErr = fmt.Sprintf("map mask load error: %v", maskErr)
+	}
+
+	mapASCII := "Map unavailable."
+	if mask != nil {
+		rendered, err := renderMap(mask, defaultMapWidth, 0, 0, false)
+		if err != nil {
+			if initialErr == "" {
+				initialErr = fmt.Sprintf("map render error: %v", err)
+			}
+		} else {
+			mapASCII = rendered
+		}
+	}
+
 	m := model{
-		frames:  []string{frameOne, frameTwo},
-		issOver: "Resolving...",
+		issOver:  "Resolving...",
+		mapMask:  mask,
+		mapASCII: mapASCII,
+		lastErr:  initialErr,
 		client: &http.Client{
 			Timeout: 8 * time.Second,
 		},
@@ -105,7 +132,7 @@ func main() {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(animTick(animInterval), telemetryTick(0))
+	return telemetryTick(0)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -119,10 +146,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-
-	case animTickMsg:
-		m.frameIndex = (m.frameIndex + 1) % len(m.frames)
-		return m, animTick(animInterval)
+		m = m.refreshMap()
 
 	case telemetryTickMsg:
 		return m, tea.Batch(telemetryTick(telemetryInterval), fetchTelemetryCmd(m.client, m.issOver))
@@ -132,6 +156,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lat = msg.lat
 		m.lon = msg.lon
 		m.hasCoords = true
+		m = m.refreshMap()
 		if msg.err != nil {
 			m.lastErr = msg.err.Error()
 		} else {
@@ -146,21 +171,68 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	frame := m.frames[m.frameIndex]
 	telemetryLines := []string{"ISS over: " + m.issOver}
 	if m.hasCoords {
-		telemetryLines = append(telemetryLines, fmt.Sprintf("Coords: %.4f, %.4f", m.lat, m.lon))
+		telemetryLines = append(telemetryLines, "Latitude:  "+formatLatitude(m.lat))
+		telemetryLines = append(telemetryLines, "Longitude: "+formatLongitude(m.lon))
 	} else {
 		telemetryLines = append(telemetryLines, "Coords: Resolving...")
 	}
-	telemetry := telemetryBox(telemetryLines)
-	return "\n" + frame + "\n\n" + telemetry
+	mapView := centerBlock(m.mapASCII, m.width)
+	telemetry := centerBlock(telemetryBox(telemetryLines), m.width)
+	return "\n" + mapView + "\n\n" + telemetry
 }
 
-func animTick(d time.Duration) tea.Cmd {
-	return tea.Tick(d, func(t time.Time) tea.Msg {
-		return animTickMsg(t)
-	})
+func (m model) refreshMap() model {
+	if m.mapMask == nil {
+		return m
+	}
+
+	size := mapWidthForTerm(m.width)
+	rendered, err := renderMap(m.mapMask, size, m.lat, m.lon, m.hasCoords)
+	if err != nil {
+		m.lastErr = err.Error()
+		return m
+	}
+
+	m.mapASCII = rendered
+	return m
+}
+
+func mapWidthForTerm(termWidth int) int {
+	if termWidth <= 0 {
+		return defaultMapWidth
+	}
+
+	width := termWidth - 4
+	if width < minMapWidth {
+		return minMapWidth
+	}
+	if width > maxMapWidth {
+		return maxMapWidth
+	}
+
+	return width
+}
+
+func renderMap(mask *mapascii.LandMask, size int, lat, lon float64, hasCoords bool) (string, error) {
+	var marker *mapascii.Marker
+	if hasCoords {
+		marker = &mapascii.Marker{
+			Lon:    lon,
+			Lat:    lat,
+			Center: 'X',
+			ArmX:   markerArmX,
+			ArmY:   markerArmY,
+		}
+	}
+
+	options := &mapascii.RenderOptions{
+		VerticalMarginRows: mapMarginRows,
+		Frame:              true,
+	}
+
+	return mapascii.RenderWorldASCIIWithOptions(mask, size, mapSupersample, mapCharAspect, marker, options)
 }
 
 func telemetryTick(d time.Duration) tea.Cmd {
@@ -358,4 +430,51 @@ func telemetryBox(lines []string) string {
 	rendered = append(rendered, border)
 
 	return strings.Join(rendered, "\n")
+}
+
+func centerBlock(block string, width int) string {
+	if width <= 0 {
+		return block
+	}
+
+	lines := strings.Split(block, "\n")
+	maxWidth := 0
+	for _, line := range lines {
+		if w := len([]rune(line)); w > maxWidth {
+			maxWidth = w
+		}
+	}
+
+	if maxWidth >= width {
+		return block
+	}
+
+	leftPad := strings.Repeat(" ", (width-maxWidth)/2)
+	for i := range lines {
+		lines[i] = leftPad + lines[i]
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func formatLatitude(lat float64) string {
+	hemisphere := "N"
+	value := lat
+	if lat < 0 {
+		hemisphere = "S"
+		value = -lat
+	}
+
+	return fmt.Sprintf("%.4f %s", value, hemisphere)
+}
+
+func formatLongitude(lon float64) string {
+	hemisphere := "E"
+	value := lon
+	if lon < 0 {
+		hemisphere = "W"
+		value = -lon
+	}
+
+	return fmt.Sprintf("%.4f %s", value, hemisphere)
 }

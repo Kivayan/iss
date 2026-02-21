@@ -2,7 +2,10 @@ module iss
 
 go 1.22
 
-require github.com/charmbracelet/bubbletea v1.3.4
+require (
+	github.com/Kivayan/map-ascii v0.1.1
+	github.com/charmbracelet/bubbletea v1.3.4
+)
 
 require (
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
