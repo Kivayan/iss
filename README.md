@@ -2,7 +2,7 @@
 
 Animated terminal app that renders an ASCII ISS and live telemetry
 
-![image](https://images2.imgbox.com/ab/14/Kmy8OhXJ_o.gif)
+![image](data/screenshot.png)
 
 ## Quick install
 

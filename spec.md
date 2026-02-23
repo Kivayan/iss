@@ -134,7 +134,7 @@ Usage policy constraints to follow:
 
 - Use one `http.Client` with timeout (recommended: 5-10 seconds).
 - Set explicit headers for Nominatim requests:
-  - `User-Agent: iss-tui/1.0 (+contact-or-repo-url)`
+  - `User-Agent: iss-tui/1.1 (+contact-or-repo-url)`
 - Decode JSON with typed structs.
 
 ## Rendering Specification
