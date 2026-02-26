@@ -14,6 +14,12 @@ Install from GitHub Releases with one command.
 curl -fsSL https://raw.githubusercontent.com/kivayan/iss/main/scripts/install.sh | bash
 ```
 
+### macOS
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kivayan/iss/main/scripts/install.sh | bash
+```
+
 ### Windows (PowerShell)
 
 ```powershell

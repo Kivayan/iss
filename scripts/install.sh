@@ -66,14 +66,36 @@ need_cmd() {
 
 need_cmd curl
 need_cmd tar
-need_cmd sha256sum
 need_cmd awk
 
-os_name="$(uname -s)"
-if [[ "$os_name" != "Linux" ]]; then
-  printf 'error: this installer supports Linux only (detected %s)\n' "$os_name" >&2
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+    return
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{ print $1 }'
+    return
+  fi
+
+  printf 'error: required command sha256sum or shasum was not found\n' >&2
   exit 1
-fi
+}
+
+os_name="$(uname -s)"
+case "$os_name" in
+  Linux)
+    os="linux"
+    ;;
+  Darwin)
+    os="darwin"
+    ;;
+  *)
+    printf 'error: this installer supports Linux and macOS only (detected %s)\n' "$os_name" >&2
+    exit 1
+    ;;
+esac
 
 machine="$(uname -m)"
 case "$machine" in
@@ -93,7 +115,7 @@ if [[ "$version" != "latest" && "$version" != v* ]]; then
   version="v${version}"
 fi
 
-asset_name="${tool_name}_linux_${arch}.tar.gz"
+asset_name="${tool_name}_${os}_${arch}.tar.gz"
 checksums_name="checksums.txt"
 
 if [[ "$version" == "latest" ]]; then
@@ -121,7 +143,7 @@ if [[ -z "$expected_checksum" ]]; then
   exit 1
 fi
 
-actual_checksum="$(sha256sum "$archive_path" | awk '{ print $1 }')"
+actual_checksum="$(sha256_file "$archive_path")"
 if [[ "$expected_checksum" != "$actual_checksum" ]]; then
   printf 'error: checksum mismatch for %s\n' "$asset_name" >&2
   exit 1
