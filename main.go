@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,13 +14,14 @@ import (
 
 	mapascii "github.com/Kivayan/map-ascii"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const (
 	telemetryInterval = 5 * time.Second
 	issURL            = "http://api.open-notify.org/iss-now.json"
 	nominatimURL      = "https://nominatim.openstreetmap.org/reverse"
-	userAgent         = "iss-tui/1.1 (+https://github.com/kivayan/iss)"
+	userAgent         = "iss-tui/1.2 (+https://github.com/kivayan/iss)"
 	defaultMapWidth   = 60
 	minMapWidth       = 30
 	maxMapWidth       = 120
@@ -42,17 +45,30 @@ type errMsg struct {
 	err error
 }
 
+type mapFrameMsg struct {
+	runID uint64
+	frame string
+	err   error
+}
+
+type mapFrameClosedMsg struct {
+	runID uint64
+}
+
 type model struct {
-	issOver   string
-	lat       float64
-	lon       float64
-	hasCoords bool
-	lastErr   string
-	width     int
-	height    int
-	client    *http.Client
-	mapMask   *mapascii.LandMask
-	mapASCII  string
+	issOver        string
+	lat            float64
+	lon            float64
+	hasCoords      bool
+	lastErr        string
+	width          int
+	height         int
+	client         *http.Client
+	mapMask        *mapascii.LandMask
+	mapASCII       string
+	mapFrameCh     chan mapFrameMsg
+	cancelMapAnim  context.CancelFunc
+	currentAnimRun uint64
 }
 
 type issPositionResponse struct {
@@ -120,13 +136,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
+			m = m.stopMapAnimation()
 			return m, tea.Quit
 		}
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m = m.refreshMap()
+		return m.syncMapState()
 
 	case telemetryTickMsg:
 		return m, tea.Batch(telemetryTick(telemetryInterval), fetchTelemetryCmd(m.client, m.issOver))
@@ -136,12 +153,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lat = msg.lat
 		m.lon = msg.lon
 		m.hasCoords = true
-		m = m.refreshMap()
 		if msg.err != nil {
 			m.lastErr = msg.err.Error()
 		} else {
 			m.lastErr = ""
 		}
+		return m.syncMapState()
+
+	case mapFrameMsg:
+		if msg.runID != m.currentAnimRun {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.lastErr = msg.err.Error()
+			return m, waitForMapFrame(m.mapFrameCh, m.currentAnimRun)
+		}
+		m.mapASCII = msg.frame
+		return m, waitForMapFrame(m.mapFrameCh, m.currentAnimRun)
+
+	case mapFrameClosedMsg:
+		if msg.runID != m.currentAnimRun {
+			return m, nil
+		}
+		m.mapFrameCh = nil
+		m.cancelMapAnim = nil
+		return m, nil
 
 	case errMsg:
 		m.lastErr = msg.err.Error()
@@ -160,23 +196,123 @@ func (m model) View() string {
 	}
 	mapView := centerBlock(m.mapASCII, m.width)
 	telemetry := centerBlock(telemetryBox(telemetryLines), m.width)
-	return "\n" + mapView + "\n\n" + telemetry
+	return "\n" + mapView + "\n\n" + telemetry + "\n"
 }
 
-func (m model) refreshMap() model {
+func (m model) syncMapState() (model, tea.Cmd) {
 	if m.mapMask == nil {
-		return m
+		return m, nil
 	}
+
+	if m.hasCoords {
+		return m.startMapAnimation()
+	}
+
+	m = m.stopMapAnimation()
 
 	size := mapWidthForTerm(m.width)
 	rendered, err := renderMap(m.mapMask, size, m.lat, m.lon, m.hasCoords)
 	if err != nil {
 		m.lastErr = err.Error()
-		return m
+		return m, nil
 	}
 
 	m.mapASCII = rendered
+	return m, nil
+}
+
+func (m model) cancelMapAnimation() model {
+	if m.cancelMapAnim != nil {
+		m.cancelMapAnim()
+	}
+	m.cancelMapAnim = nil
+	m.mapFrameCh = nil
 	return m
+}
+
+func (m model) stopMapAnimation() model {
+	m = m.cancelMapAnimation()
+	m.currentAnimRun++
+	return m
+}
+
+func (m model) startMapAnimation() (model, tea.Cmd) {
+	size := mapWidthForTerm(m.width)
+	marker := &mapascii.Marker{
+		Lon:    m.lon,
+		Lat:    m.lat,
+		Center: 'X',
+		ArmX:   markerArmX,
+		ArmY:   markerArmY,
+	}
+	renderOptions := &mapascii.RenderOptions{
+		VerticalMarginRows: mapMarginRows,
+		Frame:              true,
+		ColorMode:          "auto",
+		MapColor:           "green",
+		MarkerColor:        "blue",
+	}
+	animOptions := &mapascii.AnimationOptions{
+		FPS:   mapascii.DefaultAnimationFPS,
+		Style: mapascii.AnimationStyleBlink,
+	}
+
+	m = m.cancelMapAnimation()
+	m.currentAnimRun++
+	runID := m.currentAnimRun
+
+	ctx, cancel := context.WithCancel(context.Background())
+	frameCh := make(chan mapFrameMsg, 1)
+	m.cancelMapAnim = cancel
+	m.mapFrameCh = frameCh
+
+	go streamMapAnimation(ctx, runID, frameCh, m.mapMask, size, marker, renderOptions, animOptions)
+
+	return m, waitForMapFrame(frameCh, runID)
+}
+
+func streamMapAnimation(
+	ctx context.Context,
+	runID uint64,
+	frameCh chan<- mapFrameMsg,
+	mask *mapascii.LandMask,
+	size int,
+	marker *mapascii.Marker,
+	renderOptions *mapascii.RenderOptions,
+	animOptions *mapascii.AnimationOptions,
+) {
+	defer close(frameCh)
+
+	emit := func(frame mapascii.Frame) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case frameCh <- mapFrameMsg{runID: runID, frame: frame.Text}:
+			return nil
+		}
+	}
+
+	err := mapascii.StreamWorldASCIIAnimation(ctx, mask, size, mapSupersample, mapCharAspect, marker, renderOptions, animOptions, emit)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		select {
+		case <-ctx.Done():
+		case frameCh <- mapFrameMsg{runID: runID, err: err}:
+		}
+	}
+}
+
+func waitForMapFrame(frameCh <-chan mapFrameMsg, runID uint64) tea.Cmd {
+	if frameCh == nil {
+		return nil
+	}
+
+	return func() tea.Msg {
+		msg, ok := <-frameCh
+		if !ok {
+			return mapFrameClosedMsg{runID: runID}
+		}
+		return msg
+	}
 }
 
 func mapWidthForTerm(termWidth int) int {
@@ -210,6 +346,9 @@ func renderMap(mask *mapascii.LandMask, size int, lat, lon float64, hasCoords bo
 	options := &mapascii.RenderOptions{
 		VerticalMarginRows: mapMarginRows,
 		Frame:              true,
+		ColorMode:          "auto",
+		MapColor:           "green",
+		MarkerColor:        "blue",
 	}
 
 	return mapascii.RenderWorldASCIIWithOptions(mask, size, mapSupersample, mapCharAspect, marker, options)
@@ -420,7 +559,7 @@ func centerBlock(block string, width int) string {
 	lines := strings.Split(block, "\n")
 	maxWidth := 0
 	for _, line := range lines {
-		if w := len([]rune(line)); w > maxWidth {
+		if w := ansi.StringWidth(line); w > maxWidth {
 			maxWidth = w
 		}
 	}

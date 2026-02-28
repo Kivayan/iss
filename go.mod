@@ -3,7 +3,7 @@ module iss
 go 1.22
 
 require (
-	github.com/Kivayan/map-ascii v0.1.1
+	github.com/Kivayan/map-ascii v0.2.0
 	github.com/charmbracelet/bubbletea v1.3.4
 )
 
